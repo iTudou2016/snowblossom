@@ -37,10 +37,13 @@ java_binary(
     "//miner:miner",
   ]
 )
-
-
-
-
+java_binary(
+  name = "FrontEnd",
+  main_class = "snowblossom.miner.FrontEnd",
+  runtime_deps = [
+    "//miner:miner",
+  ]
+)
 
 java_binary(
   name = "ShackletonExplorer",
