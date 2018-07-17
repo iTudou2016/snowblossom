@@ -28,15 +28,25 @@ import java.util.logging.Logger;
 import java.util.TreeMap;
 import java.util.List;
 
-public class FrontEnd
+public class MrPlow
 {
   private static final Logger logger = Logger.getLogger("snowblossom.miner");
   
+  public static final int MIN_DIFF=22;
+  public static final int BACK_BLOCKS=5; // Roughly how many blocks back to keep shares for PPLNS
+
+  // Basically read this as if there are SHARES_IN_VIEW_FOR_RETARGET
+  // inside a single SHARE_VIEW_WINDOW, then move the miner up one difficulty
+  // So as it is set, if a miner gets 6 shares inside of 2 minutes, move them up.
+  public static final long SHARE_VIEW_WINDOW = 120000L;
+  public static final int SHARES_IN_VIEW_FOR_RETARGET = 6;
+
   public static void main(String args[]) throws Exception
   {
-     if (args.length != 1)
+    Globals.addCryptoProvider();
+    if (args.length != 1)
     {
-      logger.log(Level.SEVERE, "Incorrect syntax. Syntax: FrontEnd <config_file>");
+      logger.log(Level.SEVERE, "Incorrect syntax. Syntax: MrPlow <config_file>");
       System.exit(-1);
     }
 
@@ -44,9 +54,9 @@ public class FrontEnd
 
     LogSetup.setup(config);
 
-    FrontEnd webfe = new FrontEnd(config);
+    MrPlow miner = new MrPlow(config);
 
-    webfe.loop();
+    miner.loop();
   }
 
   private volatile Block last_block_template;
@@ -64,10 +74,10 @@ public class FrontEnd
   private MiningPoolServiceAgent agent;
 
   private ShareManager share_manager;
-  private DB db;
+	private DB db;
   private ReportManager report_manager;
 
-  public FrontEnd(Config config) throws Exception
+  public MrPlow(Config config) throws Exception
   {
     this.config = config;
     logger.info(String.format("Starting MrPlow version %s", Globals.VERSION));
@@ -80,6 +90,16 @@ public class FrontEnd
     
     params = NetworkParams.loadFromConfig(config);
 
+    if (config.getBoolean("display_timerecord"))
+    {
+      time_record = new TimeRecord();
+      TimeRecord.setSharedRecord(time_record);
+    }
+
+
+    int port = config.getIntWithDefault("mining_pool_port",23380);
+    agent = new MiningPoolServiceAgent(this);
+
     double pool_fee = config.getDouble("pool_fee");
     double duck_fee = config.getDoubleWithDefault("pay_the_duck", 0.0);
 
@@ -89,13 +109,14 @@ public class FrontEnd
     {
       fixed_fee_map.put( "snow:crqls8qkumwg353sfgf5kw2lw2snpmhy450nqezr", duck_fee);
     }
-    loadDB();
-    PPLNSState pplns_state = null;
-    try
-    {
+		loadDB();
+
+		PPLNSState pplns_state = null;
+		try
+		{
       pplns_state = PPLNSState.parseFrom(db.getSpecialMap().get("pplns_state"));
       logger.info(String.format("Loaded PPLNS state with %d entries", pplns_state.getShareEntriesCount()));
-    }
+		}
     catch(Throwable t)
     {
       logger.log(Level.WARNING, "Unable to load PPLNS state, starting fresh:" + t);
@@ -104,6 +125,14 @@ public class FrontEnd
     share_manager = new ShareManager(fixed_fee_map, pplns_state);
     report_manager = new ReportManager();
 
+    subscribe();
+
+    Server s = ServerBuilder
+      .forPort(port)
+      .addService(agent)
+      .build();
+
+    s.start();
   }
   private void loadDB()
     throws Exception
@@ -135,15 +164,101 @@ public class FrontEnd
 
     while (true)
     {
-      Thread.sleep(10000);
+      Thread.sleep(20000);
       printStats();
-     }
-   }
+      prune();
+      subscribe();
+      saveState();
+      reportState();
+
+      if (config.isSet("report_path"))
+      {
+      if (last_report + 60000L < System.currentTimeMillis())
+      {
+        report_manager.writeReport(config.get("report_path"));
+
+        last_report = System.currentTimeMillis();
+      }
+      }
+     
+
+    }
+
+
+  }
 
   private void saveState()
   {
     PPLNSState state = share_manager.getState();
     db.getSpecialMap().put("pplns_state", state.toByteString());
+  }
+  private void reportState()
+  {
+    logger.info(share_manager.getPayRatios());    
+  }
+  private ManagedChannel channel;
+
+  public void recordHashes(long n)
+  {
+    op_count.addAndGet(n);
+  }
+  private void prune()
+  {
+      Block b = last_block_template;
+      if (b!=null)
+      {
+        double diff_delta = PowUtil.getDiffForTarget(BlockchainUtil.targetBytesToBigInteger(b.getHeader().getTarget())) - MIN_DIFF;
+
+        long shares_to_keep = Math.round( Math.pow(2, diff_delta) * BACK_BLOCKS);
+        share_manager.prune(shares_to_keep);
+      }
+  }
+  private void subscribe() throws Exception
+  {
+    if (channel != null)
+    {
+      channel.shutdownNow();
+      channel = null;
+    }
+
+    String host = config.get("node_host");
+    int port = config.getIntWithDefault("node_port", params.getDefaultPort());
+    channel = ManagedChannelBuilder.forAddress(host, port).usePlaintext(true).build();
+
+    asyncStub = UserServiceGrpc.newStub(channel);
+    blockingStub = UserServiceGrpc.newBlockingStub(channel);
+
+    CoinbaseExtras.Builder extras = CoinbaseExtras.newBuilder();
+    if (config.isSet("remark"))
+    {
+      extras.setRemarks(ByteString.copyFrom(config.get("remark").getBytes()));
+    }
+    if (config.isSet("vote_yes"))
+    {
+      List<String> lst = config.getList("vote_yes");
+      for(String s : lst)
+      {
+        extras.addMotionsApproved( Integer.parseInt(s));
+      }
+    }
+    if (config.isSet("vote_no"))
+    {
+      List<String> lst = config.getList("vote_no");
+      for(String s : lst)
+      {
+        extras.addMotionsRejected( Integer.parseInt(s));
+      }
+    }
+
+
+
+    asyncStub.subscribeBlockTemplate(
+      SubscribeBlockTemplateRequest.newBuilder()
+        .putAllPayRatios( share_manager.getPayRatios() )
+        .setExtras(extras.build()).build(),
+                                     new BlockTemplateEater());
+    logger.info("Subscribed to blocks");
+
   }
 
   private AddressSpecHash getPoolAddress() throws Exception
@@ -168,10 +283,65 @@ public class FrontEnd
 
   public void printStats()
   {
+    long now = System.currentTimeMillis();
+    double count = op_count.getAndSet(0L);
+
+    double time_ms = now - last_stats_time;
+    double time_sec = time_ms / 1000.0;
+    double rate = count / time_sec;
 
     DecimalFormat df = new DecimalFormat("0.000");
+
+    String block_time_report = "";
+    if (last_block_template != null)
+    {
+      BigInteger target = BlockchainUtil.targetBytesToBigInteger(last_block_template.getHeader().getTarget());
+
+      double diff = PowUtil.getDiffForTarget(target);
+
+      double block_time_sec = Math.pow(2.0, diff) / rate;
+      double hours = block_time_sec / 3600.0;
+      block_time_report = String.format("- at this rate %s hours per block", df.format(hours));
+    }
+
     logger.info(String.format("Mining rate: %s", report_manager.getTotalRate().getReportLong(df)));
 
+    logger.info(String.format("Mining rate: %s/sec %s", df.format(rate), block_time_report));
+
+    last_stats_time = now;
+
+    if (config.getBoolean("display_timerecord"))
+    {
+
+      TimeRecord old = time_record;
+
+      time_record = new TimeRecord();
+      TimeRecord.setSharedRecord(time_record);
+
+      old.printReport(System.out);
+
+    }
   }
 
+  public Block getBlockTemplate()
+  {
+    return last_block_template;
+  }
+
+
+
+  public class BlockTemplateEater implements StreamObserver<Block>
+  {
+    public void onCompleted() {}
+
+    public void onError(Throwable t) {}
+
+    public void onNext(Block b)
+    {
+      logger.info("Got block template: height:" + b.getHeader().getBlockHeight() + " transactions:" + b.getTransactionsCount());
+
+      last_block_template = b;
+      agent.updateBlockTemplate(b);
+    }
+  }
 }
