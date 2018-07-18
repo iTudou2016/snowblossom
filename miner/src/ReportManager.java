@@ -46,11 +46,13 @@ public class ReportManager
     try
     {
 
+ 
       PrintStream out = new PrintStream(new AtomicFileOutputStream( path ));
 
       DecimalFormat df = new DecimalFormat("0.0");
-      out.println("Total: " + total.getReportLong(df));
-
+  //    out.println("Total: " + total.getReportLong(df));
+      out.println("{\n\"poolhash\":\"" + total.getReportLong(df) + "\",");
+      out.println("\"miners\": [");
       TreeSet<String> to_remove = new TreeSet<>();
       for(Map.Entry<String, RateReporter> me : rate_map.entrySet())
       {
@@ -60,7 +62,8 @@ public class ReportManager
         }
         else
         {
-          out.println(me.getKey() + " " + me.getValue().getReportLong(df));
+ //         out.println(me.getKey() + " " + me.getValue().getReportLong(df));
+          out.println(String.format("{\"account\":\"%s\", \"hashrate\":\"%s\"},", me.getKey(), me.getValue().getReportLong(df)));
         }
       }
 
@@ -68,7 +71,7 @@ public class ReportManager
       {
         rate_map.remove(k);
       }
-
+      out.println("]\n}");
       out.flush();
       out.close();
     }
